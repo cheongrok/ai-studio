@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "ai-studio"
+version = "0.1.0"
+description = "AI Prototype Studio"
+authors = ["rok805@gripcorp.co"]
+
+[tool.poetry.dependencies]
+python = "3.11.11"
+streamlit = "1.49.1"
+sqlalchemy = "^2.0.43"
+openai = "^1.102.0"
+awswrangler = "^3.12.1"
+snowflake-connector-python = "^3.17.2"
