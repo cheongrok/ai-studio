@@ -1,12 +1,10 @@
 import snowflake.connector
 import streamlit as st
 import pandas as pd
-import sqlalchemy
 from openai import OpenAI
 import awswrangler as wr
 import boto3
 import json
-import os
 import re
 
 
@@ -20,9 +18,6 @@ conn = snowflake.connector.connect(
     database=secret["database"],
     schema=secret["schema"]
 )
-
-secret_llm = json.loads(wr.secretsmanager.get_secret("prod/external-api-keys", boto3_session=session))
-client = OpenAI(api_key=secret_llm.get("openai-api-key"))
 
 
 def run_query_df(conn, sql: str) -> pd.DataFrame:
@@ -42,23 +37,6 @@ def parse_json_safely(text: str) -> dict:
         pass
 
 
-def summary(user_message):
-    resp = client.chat.completions.create(
-        model="gpt-4.1-nano",
-        messages=[
-            {"role": "system", "content": "리뷰를 요약하는 유능한 마케터야."},
-            {
-                "role": "user",
-                "content": user_message  # ✅ 문자열 그대로 전달
-            },
-        ],
-        temperature=0.5,
-        max_tokens=1000,
-    )
-    raw = resp.choices[0].message.content
-    return raw
-
-
 @st.cache_data(ttl=86400)  # 24시간 = 60*60*24초
 def product_review(seller_name: str) -> str:
     sql = f"""
@@ -70,6 +48,7 @@ def product_review(seller_name: str) -> str:
                 pi.product_id AS product_id,
                 pi.product_name AS product_name,
                 pi.flash AS flash,
+                pi.cost_price AS cost_price,
                 pr.user_seq AS user_seq,
                 pr.review_seq AS review_seq,
                 pr.review AS review,
@@ -84,16 +63,26 @@ def product_review(seller_name: str) -> str:
                 LEFT JOIN grip_db_realtime.product_preview_image ppi ON ppi.product_seq = pi.product_seq
             WHERE
                 m.user_name = '{seller_name}'
-                AND pr.created_at > CURRENT_TIMESTAMP - INTERVAL '30 DAY'
+                AND pr.created_at > CURRENT_TIMESTAMP - INTERVAL '6 MONTH'
                 AND pr.review_length > 0
                 AND pi.cost_price > 0
+        ),
+
+        t2 AS (
+            SELECT
+                relation_seq,
+                image_path AS review_image_path
+            FROM grip_db_realtime.attached_image
+            WHERE image_type = 14
         )
+
         SELECT
             t1.seller_seq,
             t1.seller_name,
             t1.product_seq,
             t1.product_id,
             t1.product_name,
+            t1.cost_price,
             t1.flash,
             t1.user_seq,
             m.user_name AS user_name,
@@ -103,14 +92,18 @@ def product_review(seller_name: str) -> str:
             t1.review_length,
             t1.created_at_review,
             t1.seller_comment,
-            t1.image_path
+            t1.image_path,
+            t1.product_name<>t1.review,
+            CONCAT('https://thumb-ssl.grip.show', t2.review_image_path, '?type=w&w=150') AS review_image_path
+
         FROM t1
-        LEFT JOIN grip_db_realtime.member m ON m.user_seq = t1.user_seq
+            LEFT JOIN grip_db_realtime.member m ON m.user_seq = t1.user_seq
+            LEFT JOIN t2 ON t2.relation_seq = t1.review_seq
     """
     df = run_query_df(conn, sql)
     df = df.drop_duplicates(['PRODUCT_SEQ', 'REVIEW'])
+    df = df.sort_values(['REVIEW_LENGTH'], ascending=False)
     return df
-
 
 @st.cache_data(ttl=86400)  # 24시간 = 60*60*24초
 def flash_product_info():
@@ -141,8 +134,8 @@ def flash_product_info():
                    left join grip_db_realtime.member m on m.user_seq = c.user_seq
 
           where fpi.product_id is not null
-            and pi.deleted = 'N'
-            and pi.excluded = 'N'
+            -- and pi.deleted = 'N'
+            -- and pi.excluded = 'N'
             and pi.cost_price > 0 \
           """
     df = run_query_df(conn, sql)
@@ -191,12 +184,56 @@ def prep_review(words):
 
 st.set_page_config(layout="wide")
 if __name__ == "__main__":
-    st.title("🧾 리뷰 테스트")
-    seller_name = st.text_input("이름을 입력해주세요.")
+    st.title("🧾 포토후기")
+    st.markdown("""
+    - 판매자 이름을 입력하면 해당 판매자의 포토후기를 조회합니다.
+    - 최근 12개월 이내 작성된 포토후기만 조회합니다.
+    """)
+
+
+    seller_name = st.text_input("이름을 입력해주세요.", placeholder="예: 제제시스터")
     if seller_name:
+
         review_df = product_review(seller_name)
         flash_df = flash_product_info()
         always_df = always_product_info()
+        flash_sub_df = flash_df[[
+            "PRODUCT_NAME", "LV2_CATEGORY_NAME", "LV3_CATEGORY_NAME", "LV4_CATEGORY_NAME",
+            "PRODUCT_ID", "COST_PRICE"
+        ]]
+        flash_sub_df = flash_sub_df.rename(columns={"PRODUCT_NAME": "LLM_PRODUCT_NAME"})
+        flash_sub_df = flash_sub_df.fillna("").drop_duplicates(["PRODUCT_ID"])
 
-    print('hello')
+        always_sub_df = always_df.drop_duplicates(["PRODUCT_ID", "CATEGORY_SEQ"])
+        always_sub_df = always_sub_df.groupby("PRODUCT_ID")["CATEGORY_NAME"].apply(list).reset_index(
+            name="CATEGORY_LIST")
+
+        product_df = pd.merge(always_sub_df, flash_sub_df, how="outer")
+
+        review_sub_df = pd.merge(review_df, product_df, on="PRODUCT_ID", how="left")
+        review_sub_df = review_sub_df.fillna("")
+        st.dataframe(review_sub_df.head(1))
+        # --- 여기부터 이미지 3열 종대 출력 ---
+        # URL 정제(빈 값/공백/비URL 제거)
+        urls = (
+            review_sub_df["REVIEW_IMAGE_PATH"]
+            .dropna()
+            .astype(str)
+            .map(str.strip)
+            .tolist()
+        )
+        urls = [u for u in urls if u.startswith("http://") or u.startswith("https://")]
+
+
+        # 3열 종대 이미지 그리드 표시
+        if urls:
+            # 행 단위(3개씩)로 끊어 배치하면 좌→우, 위→아래 순으로 깔끔하게 정렬됩니다.
+            for i in range(0, len(urls), 3):
+                row_urls = urls[i:i + 3]
+                cols = st.columns(3, gap="small")
+                for col, u in zip(cols, row_urls):
+                    with col:
+                        st.image(u, use_container_width=False, width=300)
+        else:
+            st.info("표시할 이미지가 없습니다.")
 
